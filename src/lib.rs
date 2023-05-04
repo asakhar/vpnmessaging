@@ -4,6 +4,8 @@ use std::{
   time::{Duration, Instant},
 };
 
+pub use qprov;
+
 use arrayref::array_refs;
 pub use mio;
 use qprov::{keys::CertificateChain, Encapsulated, PubKeyPair, SecKeyPair};
