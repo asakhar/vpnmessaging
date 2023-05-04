@@ -1,0 +1,3 @@
+[submodule "qprov"]
+	path = qprov
+	url = git@github.com:asakhar/qprov.git
