@@ -1,6 +1,7 @@
 use std::{
   io::ErrorKind,
   net::{Ipv4Addr, SocketAddr},
+  time::{Duration, Instant},
 };
 
 use arrayref::array_refs;
@@ -392,7 +393,7 @@ impl TransmissionMessage {
 }
 
 pub fn send_ack(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   id: Uuid,
   ack: u32,
   buffer: &mut [u8],
@@ -403,7 +404,7 @@ pub fn send_ack(
 }
 
 pub fn send_fin(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   id: Uuid,
   buffer: &mut [u8],
 ) -> std::io::Result<()> {
@@ -413,7 +414,7 @@ pub fn send_fin(
 }
 
 pub fn send_unreliable(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   message: PlainMessage,
   buffer: &mut [u8],
 ) -> std::io::Result<()> {
@@ -429,19 +430,27 @@ const BULK_LEN: usize = 3;
 const MAX_ATTEMPTS: usize = 10;
 
 pub fn send_guaranteed(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   message: PlainMessage,
   buffer: &mut [u8],
+  timeout: Option<Duration>,
 ) -> std::io::Result<()> {
   let (id, parts) = message.into_parts_with_ack(MESSAGE_PART_LEN);
   let mut last_ack = 0;
+  let started = Instant::now();
   'outer: loop {
     for part in parts.iter().skip(last_ack).take(BULK_LEN) {
       let len = part.serialize_into(buffer);
       loop {
         match socket.send(&buffer[..len]) {
           Ok(_) => break,
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+          Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            if let Some(timeout) = timeout {
+              if Instant::now().duration_since(started) > timeout {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
+              }
+            }
+          }
           Err(err) => return Err(err),
         }
       }
@@ -452,6 +461,11 @@ pub fn send_guaranteed(
         match socket.recv(buffer) {
           Ok(len) => break len,
           Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            if let Some(timeout) = timeout {
+              if Instant::now().duration_since(started) > timeout {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
+              }
+            }
             if attempts > MAX_ATTEMPTS {
               continue 'outer;
             }
@@ -476,7 +490,7 @@ pub fn send_guaranteed(
 }
 
 pub fn send_ack_to(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   target: SocketAddr,
   id: Uuid,
   ack: u32,
@@ -488,7 +502,7 @@ pub fn send_ack_to(
 }
 
 pub fn send_fin_to(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   target: SocketAddr,
   id: Uuid,
   buffer: &mut [u8],
@@ -499,7 +513,7 @@ pub fn send_fin_to(
 }
 
 pub fn send_unreliable_to(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   target: SocketAddr,
   message: PlainMessage,
   buffer: &mut [u8],
@@ -514,20 +528,28 @@ pub fn send_unreliable_to(
 }
 
 pub fn send_guaranteed_to(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   target: SocketAddr,
   message: PlainMessage,
   buffer: &mut [u8],
+  timeout: Option<Duration>,
 ) -> std::io::Result<()> {
   let (id, parts) = message.into_parts_with_ack(MESSAGE_PART_LEN);
   let mut last_ack = 0;
+  let started = Instant::now();
   'outer: loop {
     for part in parts.iter().skip(last_ack).take(BULK_LEN) {
       let len = part.serialize_into(buffer);
       loop {
         match socket.send_to(&buffer[..len], target) {
           Ok(_) => break,
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+          Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            if let Some(timeout) = timeout {
+              if Instant::now().duration_since(started) > timeout {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
+              }
+            }
+          }
           Err(err) => return Err(err),
         }
       }
@@ -539,6 +561,11 @@ pub fn send_guaranteed_to(
         match socket.recv_from(buffer) {
           Ok((len, sender)) if sender == target => break len,
           Err(err) if err.kind() == ErrorKind::WouldBlock => {
+            if let Some(timeout) = timeout {
+              if Instant::now().duration_since(started) > timeout {
+                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
+              }
+            }
             if attempts > MAX_ATTEMPTS {
               continue 'outer;
             }
@@ -563,22 +590,32 @@ pub fn send_guaranteed_to(
 }
 
 pub fn recv_blocking(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   buffer: &mut [u8],
+  timeout: Option<Duration>,
+  started: Instant
 ) -> std::io::Result<usize> {
   loop {
     match socket.recv(buffer) {
       Ok(len) => return Ok(len),
-      Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+      Err(err) if err.kind() == ErrorKind::WouldBlock => {
+        if let Some(timeout) = timeout {
+          if Instant::now().duration_since(started) > timeout {
+            return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
+          }
+        }
+      }
       err => return err,
     }
   }
 }
 
 pub fn recv_rest_parts_blocking(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   part: MessagePart,
   buffer: &mut [u8],
+  timeout: Option<Duration>,
+  started: Instant
 ) -> std::io::Result<PlainMessage> {
   let mut messages = MessagePartsCollection::new(part.total);
   let id = part.id;
@@ -588,7 +625,7 @@ pub fn recv_rest_parts_blocking(
     message
   } else {
     loop {
-      let len = recv_blocking(socket, buffer)?;
+      let len = recv_blocking(socket, buffer, timeout, started)?;
       let message: TransmissionMessage = bincode::deserialize(&buffer[..len])
         .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
       let TransmissionMessage::Part(part) = message else {
@@ -610,11 +647,13 @@ pub fn recv_rest_parts_blocking(
 }
 
 pub fn recv_all_parts_blocking(
-  socket: &mut mio::net::UdpSocket,
+  socket: &mio::net::UdpSocket,
   buffer: &mut [u8],
+  timeout: Option<Duration>
 ) -> std::io::Result<PlainMessage> {
+  let started = Instant::now();
   let message = loop {
-    let len = recv_blocking(socket, buffer)?;
+    let len = recv_blocking(socket, buffer, timeout, started)?;
     let message: TransmissionMessage = bincode::deserialize(&buffer[..len])
       .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
     if let TransmissionMessage::Part(part) = message {
@@ -622,10 +661,10 @@ pub fn recv_all_parts_blocking(
     }
   };
 
-  recv_rest_parts_blocking(socket, message, buffer)
+  recv_rest_parts_blocking(socket, message, buffer, timeout, started)
 }
 
-pub fn receive_unreliable(socket: &mut mio::net::UdpSocket, buffer: &mut [u8]) -> Vec<MessagePart> {
+pub fn receive_unreliable(socket: &mio::net::UdpSocket, buffer: &mut [u8]) -> Vec<MessagePart> {
   let mut messages = Vec::new();
   loop {
     match socket.recv(buffer) {
