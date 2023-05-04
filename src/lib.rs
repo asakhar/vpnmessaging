@@ -438,7 +438,15 @@ pub fn send_guaranteed(
   'outer: loop {
     for part in parts.iter().skip(last_ack).take(BULK_LEN) {
       let len = part.serialize_into(buffer);
-      socket.send(&buffer[..len])?;
+      loop {
+        match socket.send(&buffer[..len]) {
+          Ok(_) => {
+            break;
+          }
+          Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+          Err(err) => return Err(err)
+        }
+      }
     }
     let mut attempts = 0;
     loop {
