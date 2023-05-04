@@ -145,6 +145,7 @@ pub enum DecryptedMessage {
   Ready { hash: KeyType },
   Welcome { ip: Ipv4Addr, mask: u8 },
   IpPacket(Vec<u8>),
+  KeepAlive
 }
 
 impl DecryptedMessage {
