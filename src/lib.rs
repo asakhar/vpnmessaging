@@ -474,83 +474,73 @@ impl From<TcpStream> for BufferedTcpStream {
   }
 }
 
-fn read_inner(stream: &mut BufferedTcpStream) -> std::io::Result<Vec<u8>> {
-  use std::io::Read;
-  if stream.read_target == 0 {
-    let mut len = [0u8; 4];
-    if stream.stream.peek(&mut len)? != 4 {
-      return Err(ErrorKind::WouldBlock.into());
-    }
-    stream.read_target = u32::from_be_bytes(len) as usize;
-    if stream.stream.read(&mut len)? != 4 {
-      return Err(ErrorKind::UnexpectedEof.into());
-    }
-    stream.inbuf.resize(stream.read_target, 0);
-  }
-  loop {
-    match stream.stream.read(&mut stream.inbuf[stream.read_size..]) {
-      Ok(0) => {
-        // Reading 0 bytes means the other side has closed the
-        // connection or is done writing, then so are we.
-        break;
-      }
-      Ok(n) => {
-        stream.read_size += n;
-      }
-      // Would block "errors" are the OS's way of saying that the
-      // connection is not actually ready to perform this I/O operation.
-      Err(ref err) if would_block(err) => break,
-
-      Err(ref err) if interrupted(err) => continue,
-      // Other errors we'll consider fatal.
-      Err(err) => {
-        return Err(err);
-      }
-    }
-  }
-  if stream.read_size != stream.read_target {
-    return Err(ErrorKind::WouldBlock.into());
-  }
-  Ok(std::mem::replace(&mut stream.inbuf, vec![]))
-}
-
 impl BufferedTcpStream {
   pub fn read_sized(&mut self) -> std::io::Result<Vec<u8>> {
-    read_inner(self)
-  }
-}
-
-fn write_inner(stream: &mut BufferedTcpStream, buf: &[u8]) -> std::io::Result<usize> {
-  stream.outbuf.extend_from_slice(buf);
-  Ok(buf.len())
-}
-
-fn flush_inner(stream: &mut BufferedTcpStream) -> std::io::Result<()> {
-  if stream.outbuf.is_empty() {
-    return stream.stream.flush();
-  }
-  loop {
-    match stream.stream.write(&stream.outbuf) {
-      Ok(n) => {
-        stream.outbuf.drain(0..n);
-        if stream.outbuf.is_empty() {
-          return stream.stream.flush();
-        }
+    use std::io::Read;
+    if self.read_target == 0 {
+      let mut len = [0u8; 4];
+      if self.stream.peek(&mut len)? != 4 {
         return Err(ErrorKind::WouldBlock.into());
       }
-      // Got interrupted (how rude!), we'll try again.
-      Err(ref err) if interrupted(err) => continue,
-      Err(err) => return Err(err),
+      self.read_target = u32::from_be_bytes(len) as usize;
+      if self.stream.read(&mut len)? != 4 {
+        return Err(ErrorKind::UnexpectedEof.into());
+      }
+      self.inbuf.resize(self.read_target, 0);
     }
+    loop {
+      match self.stream.read(&mut self.inbuf[self.read_size..]) {
+        Ok(0) => {
+          // Reading 0 bytes means the other side has closed the
+          // connection or is done writing, then so are we.
+          break;
+        }
+        Ok(n) => {
+          self.read_size += n;
+        }
+        // Would block "errors" are the OS's way of saying that the
+        // connection is not actually ready to perform this I/O operation.
+        Err(ref err) if would_block(err) => break,
+
+        Err(ref err) if interrupted(err) => continue,
+        // Other errors we'll consider fatal.
+        Err(err) => {
+          return Err(err);
+        }
+      }
+    }
+    if self.read_size != self.read_target {
+      return Err(ErrorKind::WouldBlock.into());
+    }
+    self.read_target = 0;
+    self.read_size = 0;
+    Ok(std::mem::replace(&mut self.inbuf, vec![]))
   }
 }
 
 impl std::io::Write for BufferedTcpStream {
   fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-    write_inner(self, buf)
+    self.outbuf.extend_from_slice(buf);
+    Ok(buf.len())
   }
   fn flush(&mut self) -> std::io::Result<()> {
-    flush_inner(self)
+    if self.outbuf.is_empty() {
+      return self.stream.flush();
+    }
+    loop {
+      match self.stream.write(&self.outbuf) {
+        Ok(n) => {
+          self.outbuf.drain(0..n);
+          if self.outbuf.is_empty() {
+            return self.stream.flush();
+          }
+          return Err(ErrorKind::WouldBlock.into());
+        }
+        // Got interrupted (how rude!), we'll try again.
+        Err(ref err) if interrupted(err) => continue,
+        Err(err) => return Err(err),
+      }
+    }
   }
 }
 
