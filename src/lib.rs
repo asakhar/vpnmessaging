@@ -8,7 +8,7 @@ pub use qprov;
 
 use arrayref::array_refs;
 pub use mio;
-use qprov::{keys::CertificateChain, Encapsulated, PubKeyPair, SecKeyPair};
+use qprov::{keys::CertificateChain, PubKeyPair, SecKeyPair};
 use serde::{Deserialize, Serialize};
 pub use uuid::Uuid;
 
@@ -112,15 +112,15 @@ impl KeyType {
     openssl::rand::rand_bytes(&mut key).unwrap();
     Self(key)
   }
-  pub fn decapsulate(sk: &SecKeyPair, enc: &Encapsulated) -> Self {
-    let plain = sk.decapsulate(&enc, Self::SIZE);
+  pub fn decapsulate(sk: &SecKeyPair, enc: &[u8]) -> Option<Self> {
+    let plain = sk.decapsulate(&enc, Self::SIZE)?;
     let res = unsafe { *(plain.as_bytes().as_ptr() as *const [_; Self::SIZE]) };
-    Self(res)
+    Some(Self(res))
   }
-  pub fn encapsulate(pk: &PubKeyPair) -> (Encapsulated, Self) {
-    let (shared, plain) = pk.encapsulate(Self::SIZE);
+  pub fn encapsulate(pk: &PubKeyPair) -> Option<(Vec<u8>, Self)> {
+    let (shared, plain) = pk.encapsulate(Self::SIZE)?;
     let res = unsafe { *(plain.as_bytes().as_ptr() as *const [_; Self::SIZE]) };
-    (shared, Self(res))
+    Some((shared, Self(res)))
   }
 }
 impl std::ops::BitXor<Self> for KeyType {
@@ -181,7 +181,7 @@ impl DecryptedHandshakeMessage {
 #[derive(Serialize, Deserialize)]
 pub enum HandshakeMessage {
   Hello(HelloMessage),
-  Premaster(Encapsulated),
+  Premaster(Vec<u8>),
   Ready(EncryptedHandshakeMessage),
 }
 
