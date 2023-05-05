@@ -1,5 +1,5 @@
 use std::{
-  io::ErrorKind,
+  io::{ErrorKind, Write},
   net::{Ipv4Addr, SocketAddr},
 };
 
@@ -209,7 +209,7 @@ impl EncryptedMessage {
   }
 }
 
-#[derive(Debug, Serialize, Deserialize)] 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptedHandshakeMessage(Vec<u8>);
 
 impl EncryptedHandshakeMessage {
@@ -443,92 +443,118 @@ pub fn receive_unreliable(socket: &mio::net::UdpSocket, buffer: &mut [u8]) -> Ve
   }
 }
 
+pub fn send_sized(
+  stream: &mut std::net::TcpStream,
+  message: HandshakeMessage,
+) -> std::io::Result<()> {
+  let len = bincode::serialized_size(&message)
+    .map_err(|err| std::io::Error::new(ErrorKind::Other, err))? as u32;
+  stream.write_all(&len.to_be_bytes())?;
+  bincode::serialize_into(stream, &message)
+    .map_err(|err| std::io::Error::new(ErrorKind::Other, err))
+}
+
 pub struct BufferedTcpStream {
   stream: TcpStream,
   inbuf: Vec<u8>,
   outbuf: Vec<u8>,
+  read_target: usize,
   read_size: usize,
-  read_cnt: usize,
 }
 
 impl From<TcpStream> for BufferedTcpStream {
   fn from(stream: TcpStream) -> Self {
     Self {
       stream,
-      inbuf: vec![0; 1024],
+      read_target: 0,
+      inbuf: vec![],
       outbuf: vec![],
       read_size: 0,
-      read_cnt: 0,
     }
   }
 }
 
-impl std::io::Read for BufferedTcpStream {
-  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-    loop {
-      match self.stream.read(&mut self.inbuf[self.read_size..]) {
-        Ok(0) => {
-          // Reading 0 bytes means the other side has closed the
-          // connection or is done writing, then so are we.
-          break;
-        }
-        Ok(n) => {
-          self.read_size += n;
-          let capacity = self.inbuf.len();
-          if self.read_size == capacity {
-            self.inbuf.resize(capacity + 1024, 0);
-          }
-        }
-        // Would block "errors" are the OS's way of saying that the
-        // connection is not actually ready to perform this I/O operation.
-        Err(ref err) if would_block(err) => break,
-        Err(ref err) if interrupted(err) => continue,
-        // Other errors we'll consider fatal.
-        Err(err) => return Err(err),
-      }
-    }
-    let required = std::cmp::min(buf.len(), self.read_size - self.read_cnt);
-    if required == 0 {
+fn read_inner(stream: &mut BufferedTcpStream) -> std::io::Result<Vec<u8>> {
+  use std::io::Read;
+  if stream.read_target == 0 {
+    let mut len = [0u8; 4];
+    if stream.stream.peek(&mut len)? != 4 {
       return Err(ErrorKind::WouldBlock.into());
     }
-    buf[..required].copy_from_slice(&self.inbuf[self.read_cnt..self.read_cnt + required]);
-    self.read_cnt += required;
-    Ok(required)
+    stream.read_target = u32::from_be_bytes(len) as usize;
+    if stream.stream.read(&mut len)? != 4 {
+      return Err(ErrorKind::UnexpectedEof.into());
+    }
+    stream.inbuf.resize(stream.read_target, 0);
+  }
+  loop {
+    match stream.stream.read(&mut stream.inbuf[stream.read_size..]) {
+      Ok(0) => {
+        // Reading 0 bytes means the other side has closed the
+        // connection or is done writing, then so are we.
+        break;
+      }
+      Ok(n) => {
+        stream.read_size += n;
+      }
+      // Would block "errors" are the OS's way of saying that the
+      // connection is not actually ready to perform this I/O operation.
+      Err(ref err) if would_block(err) => break,
+
+      Err(ref err) if interrupted(err) => continue,
+      // Other errors we'll consider fatal.
+      Err(err) => {
+        return Err(err);
+      }
+    }
+  }
+  if stream.read_size != stream.read_target {
+    return Err(ErrorKind::WouldBlock.into());
+  }
+  Ok(std::mem::replace(&mut stream.inbuf, vec![]))
+}
+
+impl BufferedTcpStream {
+  pub fn read_sized(&mut self) -> std::io::Result<Vec<u8>> {
+    read_inner(self)
   }
 }
 
-impl std::io::Write for BufferedTcpStream {
-  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-    self.outbuf.extend_from_slice(buf);
-    Ok(buf.len())
+fn write_inner(stream: &mut BufferedTcpStream, buf: &[u8]) -> std::io::Result<usize> {
+  stream.outbuf.extend_from_slice(buf);
+  Ok(buf.len())
+}
+
+fn flush_inner(stream: &mut BufferedTcpStream) -> std::io::Result<()> {
+  if stream.outbuf.is_empty() {
+    return stream.stream.flush();
   }
-  fn flush(&mut self) -> std::io::Result<()> {
-    if self.outbuf.is_empty() {
-      return self.stream.flush();
-    }
-    match self.stream.write(&self.outbuf) {
+  loop {
+    match stream.stream.write(&stream.outbuf) {
       Ok(n) => {
-        self.outbuf.drain(0..n);
-        if self.outbuf.is_empty() {
-          return self.stream.flush();
+        stream.outbuf.drain(0..n);
+        if stream.outbuf.is_empty() {
+          return stream.stream.flush();
         }
         return Err(ErrorKind::WouldBlock.into());
       }
       // Got interrupted (how rude!), we'll try again.
-      Err(ref err) if interrupted(err) => {
-        return self.flush();
-      }
+      Err(ref err) if interrupted(err) => continue,
       Err(err) => return Err(err),
     }
   }
 }
 
-impl BufferedTcpStream {
-  pub fn consume(&mut self) {
-    self.inbuf.drain(0..self.read_cnt);
-    self.read_size -= self.read_cnt;
-    self.read_cnt = 0;
+impl std::io::Write for BufferedTcpStream {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    write_inner(self, buf)
   }
+  fn flush(&mut self) -> std::io::Result<()> {
+    flush_inner(self)
+  }
+}
+
+impl BufferedTcpStream {
   pub fn into_inner(self) -> TcpStream {
     self.stream
   }
