@@ -488,19 +488,19 @@ impl BufferedTcpStream {
       }
       self.inbuf.resize(self.read_target, 0);
     }
-    loop {
+    let is_sero = loop {
       match self.stream.read(&mut self.inbuf[self.read_size..]) {
         Ok(0) => {
           // Reading 0 bytes means the other side has closed the
           // connection or is done writing, then so are we.
-          break;
+          break true;
         }
         Ok(n) => {
           self.read_size += n;
         }
         // Would block "errors" are the OS's way of saying that the
         // connection is not actually ready to perform this I/O operation.
-        Err(ref err) if would_block(err) => break,
+        Err(ref err) if would_block(err) => break false,
 
         Err(ref err) if interrupted(err) => continue,
         // Other errors we'll consider fatal.
@@ -508,9 +508,16 @@ impl BufferedTcpStream {
           return Err(err);
         }
       }
-    }
+    };
     if self.read_size != self.read_target {
-      return Err(ErrorKind::WouldBlock.into());
+      return Err(
+        if is_sero {
+          ErrorKind::ConnectionReset
+        } else {
+          ErrorKind::WouldBlock
+        }
+        .into(),
+      );
     }
     self.read_target = 0;
     self.read_size = 0;
@@ -556,4 +563,42 @@ pub fn would_block(err: &std::io::Error) -> bool {
 
 pub fn interrupted(err: &std::io::Error) -> bool {
   err.kind() == std::io::ErrorKind::Interrupted
+}
+
+#[derive(Debug)]
+pub enum VpnError {
+  WouldBlock,
+  InvalidData,
+  NotFound,
+  PermissionDenied,
+  Other(Box<dyn std::error::Error>),
+}
+
+impl std::fmt::Display for VpnError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_fmt(format_args!("{self:?}"))
+  }
+}
+
+pub type VpnResult<T> = Result<T, VpnError>;
+
+impl From<std::io::Error> for VpnError {
+  fn from(value: std::io::Error) -> Self {
+    match value.kind() {
+      ErrorKind::WouldBlock => Self::WouldBlock,
+      ErrorKind::InvalidData => Self::InvalidData,
+      ErrorKind::PermissionDenied => Self::PermissionDenied,
+      ErrorKind::NotFound => Self::NotFound,
+      _ => Self::Other(Box::new(value)),
+    }
+  }
+}
+
+impl From<Box<bincode::ErrorKind>> for VpnError {
+  fn from(value: Box<bincode::ErrorKind>) -> Self {
+    match *value {
+      bincode::ErrorKind::Io(err) => err.into(),
+      _ => Self::InvalidData,
+    }
+  }
 }
