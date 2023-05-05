@@ -1,9 +1,9 @@
 use std::{
   io::ErrorKind,
   net::{Ipv4Addr, SocketAddr},
-  time::{Duration, Instant},
 };
 
+use mio::net::TcpStream;
 pub use qprov;
 
 use arrayref::array_refs;
@@ -44,8 +44,12 @@ impl ClientCrypter {
       de_seq: 0,
     }
   }
-  fn generage_aad(len: usize) -> [u8; std::mem::size_of::<usize>()] {
-    len.to_be_bytes()
+  fn generage_aad(len: usize, id: Option<&[u8]>) -> Vec<u8> {
+    let mut buf = len.to_be_bytes().to_vec();
+    if let Some(id) = id {
+      buf.extend_from_slice(id);
+    }
+    buf
   }
 
   fn generate_nonce(&mut self) -> [u8; Self::NONCE_LEN] {
@@ -63,7 +67,7 @@ impl ClientCrypter {
     true
   }
 
-  pub fn seal_in_place_append_tag_nonce(&mut self, data: &mut Vec<u8>) {
+  pub fn seal_in_place_append_tag_nonce(&mut self, data: &mut Vec<u8>, id: Option<&[u8]>) {
     let total_len = data.len() + Self::TAG_LEN + Self::NONCE_LEN;
     let mut tag = [0u8; Self::TAG_LEN];
     let nonce = self.generate_nonce();
@@ -71,7 +75,7 @@ impl ClientCrypter {
       openssl::symm::Cipher::aes_256_gcm(),
       &self.key.0,
       Some(&nonce),
-      &Self::generage_aad(total_len),
+      &Self::generage_aad(total_len, id),
       &data,
       &mut tag,
     )
@@ -83,19 +87,18 @@ impl ClientCrypter {
     encrypted[len - Self::NONCE_LEN..].copy_from_slice(&nonce);
     drop(std::mem::replace(data, encrypted));
   }
-  pub fn open_in_place(&self, data: &mut Vec<u8>) -> bool {
+  pub fn open(&self, data: &Vec<u8>, id: Option<&[u8]>) -> Option<Vec<u8>> {
     let total_len = data.len();
     if total_len <= Self::NONCE_LEN + Self::TAG_LEN {
-      return false;
+      return None;
     }
     let nonce = &data[total_len - Self::NONCE_LEN..];
     let tag = &data[total_len - Self::TAG_LEN - Self::NONCE_LEN..total_len - Self::NONCE_LEN];
     let encrypted = &data[..total_len - Self::TAG_LEN - Self::NONCE_LEN];
-    let Ok(decrypted) = openssl::symm::decrypt_aead(openssl::symm::Cipher::aes_256_gcm(), &self.key.0, Some(nonce), &Self::generage_aad(total_len), encrypted, tag) else {
-      return false;
+    let Ok(decrypted) = openssl::symm::decrypt_aead(openssl::symm::Cipher::aes_256_gcm(), &self.key.0, Some(nonce), &Self::generage_aad(total_len, id), encrypted, tag) else {
+      return None;
     };
-    drop(std::mem::replace(data, decrypted));
-    true
+    Some(decrypted)
   }
 }
 
@@ -136,53 +139,84 @@ impl std::ops::BitXor<Self> for KeyType {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct HelloMessage {
-  pub chain: CertificateChain,
+  pub chain: Vec<u8>,
   pub random: KeyType,
+}
+
+impl HelloMessage {
+  pub fn chain(&self) -> Option<CertificateChain> {
+    bincode::deserialize(&self.chain).ok()
+  }
+}
+
+impl From<CertificateChain> for HelloMessage {
+  fn from(value: CertificateChain) -> Self {
+    let chain = bincode::serialize(&value).unwrap();
+    let random = KeyType::generate();
+    Self { chain, random }
+  }
+}
+
+impl HelloMessage {
+  pub fn from_serialized(chain: Vec<u8>) -> Self {
+    let random = KeyType::generate();
+    Self { chain, random }
+  }
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum DecryptedHandshakeMessage {
+  Ready { hash: KeyType },
+  Welcome { ip: Ipv4Addr, mask: u8, id: Uuid },
+}
+
+impl DecryptedHandshakeMessage {
+  pub fn encrypt(&self, crypter: &mut ClientCrypter) -> HandshakeMessage {
+    let mut data = bincode::serialize(&self).unwrap();
+    crypter.seal_in_place_append_tag_nonce(&mut data, None);
+    HandshakeMessage::Ready(EncryptedHandshakeMessage(data))
+  }
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum HandshakeMessage {
+  Hello(HelloMessage),
+  Premaster(Encapsulated),
+  Ready(EncryptedHandshakeMessage),
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum DecryptedMessage {
-  Ready { hash: KeyType },
-  Welcome { ip: Ipv4Addr, mask: u8 },
   IpPacket(Vec<u8>),
-  KeepAlive
+  KeepAlive,
 }
 
 impl DecryptedMessage {
-  pub fn encrypt(&self, crypter: &mut ClientCrypter) -> PlainMessage {
-    match self {
-      DecryptedMessage::Ready { .. } => {
-        let mut data = bincode::serialize(&self).unwrap();
-        crypter.seal_in_place_append_tag_nonce(&mut data);
-        PlainMessage::Ready(EncryptedMessage(data))
-      }
-      _ => {
-        let mut data = bincode::serialize(&self).unwrap();
-        crypter.seal_in_place_append_tag_nonce(&mut data);
-        PlainMessage::Encrypted(EncryptedMessage(data))
-      }
-    }
+  pub fn encrypt(&self, crypter: &mut ClientCrypter, id: Uuid) -> EncryptedMessage {
+    let mut data = bincode::serialize(&self).unwrap();
+    crypter.seal_in_place_append_tag_nonce(&mut data, Some(id.as_bytes()));
+    EncryptedMessage(data, id)
   }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct EncryptedMessage(Vec<u8>);
+pub struct EncryptedMessage(Vec<u8>, Uuid);
 
 impl EncryptedMessage {
-  pub fn decrypt(mut self, crypter: &mut ClientCrypter) -> Option<DecryptedMessage> {
-    if !crypter.open_in_place(&mut self.0) {
-      return None;
-    }
-    bincode::deserialize(&self.0).ok()
+  pub fn decrypt(&self, crypter: &mut ClientCrypter) -> Option<DecryptedMessage> {
+    let opened = crypter.open(&self.0, Some(self.1.as_bytes()))?;
+    bincode::deserialize(&opened).ok()
   }
 }
 
-#[derive(Serialize, Deserialize)]
-pub enum PlainMessage {
-  Hello(HelloMessage),
-  Premaster(Encapsulated),
-  Ready(EncryptedMessage),
-  Encrypted(EncryptedMessage),
+#[derive(Debug, Serialize, Deserialize)] 
+pub struct EncryptedHandshakeMessage(Vec<u8>);
+
+impl EncryptedHandshakeMessage {
+  pub fn decrypt(&self, crypter: &mut ClientCrypter) -> Option<DecryptedHandshakeMessage> {
+    let opened = crypter.open(&self.0, None)?;
+    bincode::deserialize(&opened).ok()
+  }
 }
 
 struct Generator {
@@ -226,8 +260,8 @@ impl std::io::Write for Generator {
   }
 }
 
-impl PlainMessage {
-  pub fn into_parts_without_ack(&self, part_size: usize) -> Vec<TransmissionMessage> {
+impl EncryptedMessage {
+  pub fn into_parts(&self, part_size: usize) -> Vec<MessagePart> {
     let mut messages = Generator::new(part_size);
     bincode::serialize_into(&mut messages, self).unwrap();
     let messages = messages.into_inner();
@@ -237,39 +271,16 @@ impl PlainMessage {
     messages
       .into_iter()
       .enumerate()
-      .map(|(i, data)| {
-        TransmissionMessage::Part(MessagePart {
-          requires_ack: false,
-          id,
-          total,
-          index: i as u32,
-          data,
-        })
+      .map(|(i, data)| MessagePart {
+        id,
+        total,
+        index: i as u32,
+        data,
       })
       .collect()
   }
-  pub fn into_parts_with_ack(&self, part_size: usize) -> (Uuid, Vec<TransmissionMessage>) {
-    let mut messages = Generator::new(part_size);
-    bincode::serialize_into(&mut messages, self).unwrap();
-    let messages = messages.into_inner();
-    let total = messages.len() as u32;
-    let id = Uuid::new_v4();
-    (
-      id,
-      messages
-        .into_iter()
-        .enumerate()
-        .map(|(i, data)| {
-          TransmissionMessage::Part(MessagePart {
-            requires_ack: true,
-            id,
-            total,
-            index: i as u32,
-            data,
-          })
-        })
-        .collect(),
-    )
+  pub fn get_sender_id(&self) -> Uuid {
+    self.1
   }
 }
 
@@ -279,7 +290,6 @@ pub struct MessagePart {
   pub id: Uuid,
   pub total: u32,
   pub index: u32,
-  pub requires_ack: bool,
 }
 
 impl std::fmt::Display for MessagePart {
@@ -335,7 +345,7 @@ impl MessagePartsCollection {
       .next()
       .unwrap_or(self.count) as u32
   }
-  pub fn add(&mut self, message: MessagePart) -> std::io::Result<Option<PlainMessage>> {
+  pub fn add(&mut self, message: MessagePart) -> std::io::Result<Option<EncryptedMessage>> {
     if message.total as usize != self.messages.len() {
       return Err(std::io::Error::new(
         ErrorKind::InvalidInput,
@@ -357,7 +367,7 @@ impl MessagePartsCollection {
     }
     self.drain()
   }
-  fn drain(&mut self) -> std::io::Result<Option<PlainMessage>> {
+  fn drain(&mut self) -> std::io::Result<Option<EncryptedMessage>> {
     if self.count != self.messages.len() {
       return Ok(None);
     }
@@ -379,14 +389,7 @@ impl MessagePartsCollection {
 
 pub const MESSAGE_PART_LEN: usize = 0xFFFF - 80;
 
-#[derive(Serialize, Deserialize)]
-pub enum TransmissionMessage {
-  Part(MessagePart),
-  Ack(Uuid, u32),
-  Fin(Uuid),
-}
-
-impl TransmissionMessage {
+impl MessagePart {
   pub fn serialize_into(&self, buf: &mut [u8]) -> usize {
     let total_size = buf.len();
     let mut slice = &mut buf[..];
@@ -395,33 +398,12 @@ impl TransmissionMessage {
   }
 }
 
-pub fn send_ack(
-  socket: &mio::net::UdpSocket,
-  id: Uuid,
-  ack: u32,
-  buffer: &mut [u8],
-) -> std::io::Result<()> {
-  let msg = TransmissionMessage::Ack(id, ack);
-  let len = msg.serialize_into(buffer);
-  socket.send(&buffer[..len]).map(|_| ())
-}
-
-pub fn send_fin(
-  socket: &mio::net::UdpSocket,
-  id: Uuid,
-  buffer: &mut [u8],
-) -> std::io::Result<()> {
-  let msg = TransmissionMessage::Fin(id);
-  let len = msg.serialize_into(buffer);
-  socket.send(&buffer[..len]).map(|_| ())
-}
-
 pub fn send_unreliable(
   socket: &mio::net::UdpSocket,
-  message: PlainMessage,
+  message: EncryptedMessage,
   buffer: &mut [u8],
 ) -> std::io::Result<()> {
-  let parts = message.into_parts_without_ack(MESSAGE_PART_LEN);
+  let parts = message.into_parts(MESSAGE_PART_LEN);
 
   for part in parts.iter() {
     let len = part.serialize_into(buffer);
@@ -429,99 +411,14 @@ pub fn send_unreliable(
   }
   Ok(())
 }
-const BULK_LEN: usize = 3;
-const MAX_ATTEMPTS: usize = 10;
-
-pub fn send_guaranteed(
-  socket: &mio::net::UdpSocket,
-  message: PlainMessage,
-  buffer: &mut [u8],
-  timeout: Option<Duration>,
-) -> std::io::Result<()> {
-  let (id, parts) = message.into_parts_with_ack(MESSAGE_PART_LEN);
-  let mut last_ack = 0;
-  let started = Instant::now();
-  'outer: loop {
-    for part in parts.iter().skip(last_ack).take(BULK_LEN) {
-      let len = part.serialize_into(buffer);
-      loop {
-        match socket.send(&buffer[..len]) {
-          Ok(_) => break,
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {
-            if let Some(timeout) = timeout {
-              if Instant::now().duration_since(started) > timeout {
-                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
-              }
-            }
-          }
-          Err(err) => return Err(err),
-        }
-      }
-    }
-    let mut attempts = 0;
-    loop {
-      let len = loop {
-        match socket.recv(buffer) {
-          Ok(len) => break len,
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {
-            if let Some(timeout) = timeout {
-              if Instant::now().duration_since(started) > timeout {
-                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
-              }
-            }
-            if attempts > MAX_ATTEMPTS {
-              continue 'outer;
-            }
-            attempts += 1;
-            continue;
-          }
-          err => err?,
-        };
-      };
-      let trans_msg: TransmissionMessage = bincode::deserialize(&buffer[..len])
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-      match trans_msg {
-        TransmissionMessage::Ack(recv_id, ack) if id == recv_id => {
-          last_ack = std::cmp::max(last_ack, ack as usize + 1);
-        }
-        TransmissionMessage::Fin(recv_id) if id == recv_id => break 'outer,
-        _ => {}
-      }
-    }
-  }
-  Ok(())
-}
-
-pub fn send_ack_to(
-  socket: &mio::net::UdpSocket,
-  target: SocketAddr,
-  id: Uuid,
-  ack: u32,
-  buffer: &mut [u8],
-) -> std::io::Result<()> {
-  let msg = TransmissionMessage::Ack(id, ack);
-  let len = msg.serialize_into(buffer);
-  socket.send_to(&buffer[..len], target).map(|_| ())
-}
-
-pub fn send_fin_to(
-  socket: &mio::net::UdpSocket,
-  target: SocketAddr,
-  id: Uuid,
-  buffer: &mut [u8],
-) -> std::io::Result<()> {
-  let msg = TransmissionMessage::Fin(id);
-  let len = msg.serialize_into(buffer);
-  socket.send_to(&buffer[..len], target).map(|_| ())
-}
 
 pub fn send_unreliable_to(
   socket: &mio::net::UdpSocket,
   target: SocketAddr,
-  message: PlainMessage,
+  message: EncryptedMessage,
   buffer: &mut [u8],
 ) -> std::io::Result<()> {
-  let parts = message.into_parts_without_ack(MESSAGE_PART_LEN);
+  let parts = message.into_parts(MESSAGE_PART_LEN);
 
   for part in parts.iter() {
     let len = part.serialize_into(buffer);
@@ -530,149 +427,12 @@ pub fn send_unreliable_to(
   Ok(())
 }
 
-pub fn send_guaranteed_to(
-  socket: &mio::net::UdpSocket,
-  target: SocketAddr,
-  message: PlainMessage,
-  buffer: &mut [u8],
-  timeout: Option<Duration>,
-) -> std::io::Result<()> {
-  let (id, parts) = message.into_parts_with_ack(MESSAGE_PART_LEN);
-  let mut last_ack = 0;
-  let started = Instant::now();
-  'outer: loop {
-    for part in parts.iter().skip(last_ack).take(BULK_LEN) {
-      let len = part.serialize_into(buffer);
-      loop {
-        match socket.send_to(&buffer[..len], target) {
-          Ok(_) => break,
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {
-            if let Some(timeout) = timeout {
-              if Instant::now().duration_since(started) > timeout {
-                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
-              }
-            }
-          }
-          Err(err) => return Err(err),
-        }
-      }
-    }
-
-    let mut attempts = 0;
-    loop {
-      let len = loop {
-        match socket.recv_from(buffer) {
-          Ok((len, sender)) if sender == target => break len,
-          Err(err) if err.kind() == ErrorKind::WouldBlock => {
-            if let Some(timeout) = timeout {
-              if Instant::now().duration_since(started) > timeout {
-                return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
-              }
-            }
-            if attempts > MAX_ATTEMPTS {
-              continue 'outer;
-            }
-            attempts += 1;
-            continue;
-          }
-          err => err?,
-        };
-      };
-      let trans_msg: TransmissionMessage = bincode::deserialize(&buffer[..len])
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-      match trans_msg {
-        TransmissionMessage::Ack(recv_id, ack) if id == recv_id => {
-          last_ack = std::cmp::max(last_ack, ack as usize);
-        }
-        TransmissionMessage::Fin(recv_id) if id == recv_id => break 'outer,
-        _ => {}
-      }
-    }
-  }
-  Ok(())
-}
-
-pub fn recv_blocking(
-  socket: &mio::net::UdpSocket,
-  buffer: &mut [u8],
-  timeout: Option<Duration>,
-  started: Instant
-) -> std::io::Result<usize> {
-  loop {
-    match socket.recv(buffer) {
-      Ok(len) => return Ok(len),
-      Err(err) if err.kind() == ErrorKind::WouldBlock => {
-        if let Some(timeout) = timeout {
-          if Instant::now().duration_since(started) > timeout {
-            return Err(std::io::Error::new(ErrorKind::TimedOut, "Request timedout"));
-          }
-        }
-      }
-      err => return err,
-    }
-  }
-}
-
-pub fn recv_rest_parts_blocking(
-  socket: &mio::net::UdpSocket,
-  part: MessagePart,
-  buffer: &mut [u8],
-  timeout: Option<Duration>,
-  started: Instant
-) -> std::io::Result<PlainMessage> {
-  let mut messages = MessagePartsCollection::new(part.total);
-  let id = part.id;
-  let message = if let Some(message) = messages.add(part)? {
-    send_ack(socket, id, 0, buffer)?;
-    send_fin(socket, id, buffer)?;
-    message
-  } else {
-    loop {
-      let len = recv_blocking(socket, buffer, timeout, started)?;
-      let message: TransmissionMessage = bincode::deserialize(&buffer[..len])
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-      let TransmissionMessage::Part(part) = message else {
-        continue;
-      };
-      if let Some(message) = messages.add(part)? {
-        send_ack(socket, id, messages.first_unreceived() - 1, buffer)?;
-        send_fin(socket, id, buffer)?;
-        break message;
-      }
-      let first_unrecv = messages.first_unreceived();
-      if first_unrecv == 0 {
-        continue;
-      }
-      send_ack(socket, id, first_unrecv - 1, buffer)?;
-    }
-  };
-  Ok(message)
-}
-
-pub fn recv_all_parts_blocking(
-  socket: &mio::net::UdpSocket,
-  buffer: &mut [u8],
-  timeout: Option<Duration>
-) -> std::io::Result<PlainMessage> {
-  let started = Instant::now();
-  let message = loop {
-    let len = recv_blocking(socket, buffer, timeout, started)?;
-    let message: TransmissionMessage = bincode::deserialize(&buffer[..len])
-      .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
-    if let TransmissionMessage::Part(part) = message {
-      break part;
-    }
-  };
-
-  recv_rest_parts_blocking(socket, message, buffer, timeout, started)
-}
-
 pub fn receive_unreliable(socket: &mio::net::UdpSocket, buffer: &mut [u8]) -> Vec<MessagePart> {
   let mut messages = Vec::new();
   loop {
     match socket.recv(buffer) {
       Ok(len) => {
-        let Ok(TransmissionMessage::Part(part)) = bincode::deserialize(&buffer[..len]) else {
+        let Ok(part) = bincode::deserialize(&buffer[..len]) else {
           continue;
         };
         messages.push(part);
@@ -681,4 +441,103 @@ pub fn receive_unreliable(socket: &mio::net::UdpSocket, buffer: &mut [u8]) -> Ve
       _ => {}
     }
   }
+}
+
+pub struct BufferedTcpStream {
+  stream: TcpStream,
+  inbuf: Vec<u8>,
+  outbuf: Vec<u8>,
+  read_size: usize,
+  read_cnt: usize,
+}
+
+impl From<TcpStream> for BufferedTcpStream {
+  fn from(stream: TcpStream) -> Self {
+    Self {
+      stream,
+      inbuf: vec![0; 1024],
+      outbuf: vec![],
+      read_size: 0,
+      read_cnt: 0,
+    }
+  }
+}
+
+impl std::io::Read for BufferedTcpStream {
+  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+      match self.stream.read(&mut self.inbuf[self.read_size..]) {
+        Ok(0) => {
+          // Reading 0 bytes means the other side has closed the
+          // connection or is done writing, then so are we.
+          break;
+        }
+        Ok(n) => {
+          self.read_size += n;
+          let capacity = self.inbuf.len();
+          if self.read_size == capacity {
+            self.inbuf.resize(capacity + 1024, 0);
+          }
+        }
+        // Would block "errors" are the OS's way of saying that the
+        // connection is not actually ready to perform this I/O operation.
+        Err(ref err) if would_block(err) => break,
+        Err(ref err) if interrupted(err) => continue,
+        // Other errors we'll consider fatal.
+        Err(err) => return Err(err),
+      }
+    }
+    let required = std::cmp::min(buf.len(), self.read_size - self.read_cnt);
+    if required == 0 {
+      return Err(ErrorKind::WouldBlock.into());
+    }
+    buf[..required].copy_from_slice(&self.inbuf[self.read_cnt..self.read_cnt + required]);
+    self.read_cnt += required;
+    Ok(required)
+  }
+}
+
+impl std::io::Write for BufferedTcpStream {
+  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    self.outbuf.extend_from_slice(buf);
+    Ok(buf.len())
+  }
+  fn flush(&mut self) -> std::io::Result<()> {
+    if self.outbuf.is_empty() {
+      return self.stream.flush();
+    }
+    match self.stream.write(&self.outbuf) {
+      Ok(n) => {
+        self.outbuf.drain(0..n);
+        if self.outbuf.is_empty() {
+          return self.stream.flush();
+        }
+        return Err(ErrorKind::WouldBlock.into());
+      }
+      // Got interrupted (how rude!), we'll try again.
+      Err(ref err) if interrupted(err) => {
+        return self.flush();
+      }
+      Err(err) => return Err(err),
+    }
+  }
+}
+
+impl BufferedTcpStream {
+  pub fn consume(&mut self) {
+    self.inbuf.drain(0..self.read_cnt);
+    self.read_size -= self.read_cnt;
+    self.read_cnt = 0;
+  }
+  pub fn into_inner(self) -> TcpStream {
+    self.stream
+  }
+}
+
+pub fn would_block(err: &std::io::Error) -> bool {
+  err.kind() == std::io::ErrorKind::WouldBlock
+}
+
+pub fn interrupted(err: &std::io::Error) -> bool {
+  err.kind() == std::io::ErrorKind::Interrupted
 }
