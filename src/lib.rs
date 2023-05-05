@@ -10,7 +10,7 @@ use arrayref::array_refs;
 pub use mio;
 use qprov::{keys::CertificateChain, Encapsulated, PubKeyPair, SecKeyPair};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+pub use uuid::Uuid;
 
 // Q: is it safe to do this?
 pub fn iv_from_hello(hello: KeyType) -> u128 {
@@ -149,8 +149,8 @@ impl HelloMessage {
   }
 }
 
-impl From<CertificateChain> for HelloMessage {
-  fn from(value: CertificateChain) -> Self {
+impl From<&CertificateChain> for HelloMessage {
+  fn from(value: &CertificateChain) -> Self {
     let chain = bincode::serialize(&value).unwrap();
     let random = KeyType::generate();
     Self { chain, random }
