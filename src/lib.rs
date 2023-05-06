@@ -451,7 +451,7 @@ pub fn receive_unreliable(socket: &mio::net::UdpSocket, buffer: &mut [u8]) -> Ve
 }
 
 pub fn send_sized(
-  stream: &mut std::net::TcpStream,
+  mut stream: impl Write,
   message: HandshakeMessage,
 ) -> std::io::Result<()> {
   let len = bincode::serialized_size(&message)
