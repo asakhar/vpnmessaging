@@ -578,6 +578,7 @@ pub enum VpnError {
   InvalidData,
   NotFound,
   PermissionDenied,
+  ConnectionReset,
   Other(Box<dyn std::error::Error>),
 }
 
@@ -596,6 +597,7 @@ impl From<std::io::Error> for VpnError {
       ErrorKind::InvalidData => Self::InvalidData,
       ErrorKind::PermissionDenied => Self::PermissionDenied,
       ErrorKind::NotFound => Self::NotFound,
+      ErrorKind::ConnectionReset => Self::ConnectionReset,
       _ => Self::Other(Box::new(value)),
     }
   }
