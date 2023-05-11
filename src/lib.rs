@@ -40,7 +40,7 @@ impl ClientCrypter {
     Self {
       key,
       iv,
-      en_seq: 0,
+      en_seq: 1,
       de_seq: 0,
     }
   }
@@ -58,7 +58,7 @@ impl ClientCrypter {
     nonce
   }
 
-  pub fn update_nonce(&mut self, nonce: [u8; Self::NONCE_LEN]) -> bool {
+  fn update_nonce(&mut self, nonce: [u8; Self::NONCE_LEN]) -> bool {
     let req_seq = u128::from_be_bytes(nonce).wrapping_sub(self.iv) as u64;
     if req_seq <= self.de_seq {
       return false;
@@ -87,17 +87,20 @@ impl ClientCrypter {
     encrypted[len - Self::NONCE_LEN..].copy_from_slice(&nonce);
     drop(std::mem::replace(data, encrypted));
   }
-  pub fn open(&self, data: &Vec<u8>, id: Option<&[u8]>) -> Option<Vec<u8>> {
+  pub fn open(&mut self, data: &Vec<u8>, id: Option<&[u8]>) -> Option<Vec<u8>> {
     let total_len = data.len();
     if total_len <= Self::NONCE_LEN + Self::TAG_LEN {
       return None;
     }
-    let nonce = &data[total_len - Self::NONCE_LEN..];
+    let nonce = arrayref::array_ref![data, total_len - Self::NONCE_LEN, 16];
     let tag = &data[total_len - Self::TAG_LEN - Self::NONCE_LEN..total_len - Self::NONCE_LEN];
     let encrypted = &data[..total_len - Self::TAG_LEN - Self::NONCE_LEN];
     let Ok(decrypted) = openssl::symm::decrypt_aead(openssl::symm::Cipher::aes_256_gcm(), &self.key.0, Some(nonce), &Self::generage_aad(total_len, id), encrypted, tag) else {
       return None;
     };
+    if !self.update_nonce(*nonce) {
+      return None;
+    }
     Some(decrypted)
   }
 }
