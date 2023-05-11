@@ -87,7 +87,7 @@ impl ClientCrypter {
     encrypted[len - Self::NONCE_LEN..].copy_from_slice(&nonce);
     drop(std::mem::replace(data, encrypted));
   }
-  pub fn open(&mut self, data: &Vec<u8>, id: Option<&[u8]>) -> Option<Vec<u8>> {
+  pub fn open(&mut self, data: &[u8], id: Option<&[u8]>) -> Option<Vec<u8>> {
     let total_len = data.len();
     if total_len <= Self::NONCE_LEN + Self::TAG_LEN {
       return None;
