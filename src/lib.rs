@@ -18,8 +18,8 @@ pub fn iv_from_hello(hello: KeyType) -> u128 {
   u128::from_be_bytes(*a) ^ u128::from_be_bytes(*b)
 }
 
-pub fn compare_hashes(_lhs: KeyType, _rhs: KeyType) -> bool {
-  true
+pub fn compare_hashes(lhs: KeyType, rhs: KeyType) -> bool {
+  openssl::memcmp::eq(&lhs.0, &rhs.0)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
