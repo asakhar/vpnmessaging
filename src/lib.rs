@@ -18,12 +18,16 @@ pub fn iv_from_hello(hello: KeyType) -> u128 {
   u128::from_be_bytes(*a) ^ u128::from_be_bytes(*b)
 }
 
-pub fn compare_hashes(lhs: KeyType, rhs: KeyType) -> bool {
-  openssl::memcmp::eq(&lhs.0, &rhs.0)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct KeyType([u8; Self::SIZE]);
+
+impl PartialEq for KeyType {
+  fn eq(&self, other: &Self) -> bool {
+    openssl::memcmp::eq(&self.0, &other.0)
+  }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct KeyType([u8; Self::SIZE]);
+impl Eq for KeyType {}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ClientCrypter {
