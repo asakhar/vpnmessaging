@@ -11,6 +11,8 @@ pub use mio;
 use qprov::{keys::CertificateChain, PubKeyPair, SecKeyPair};
 use serde::{Deserialize, Serialize};
 pub use uuid::Uuid;
+mod transient_hashmap;
+pub use transient_hashmap::*;
 
 // Q: is it safe to do this?
 pub fn iv_from_hello(hello: KeyType) -> u128 {
