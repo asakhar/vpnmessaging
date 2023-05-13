@@ -103,6 +103,10 @@ impl ClientCrypter {
       return None;
     };
     if !self.update_nonce(*nonce) {
+      println!(
+        "received message with outdated nonce: {nonce:?}, expected nonce: {:?}",
+        self.iv.wrapping_add(self.de_seq as u128 + 1).to_be_bytes()
+      );
       return None;
     }
     Some(decrypted)
@@ -451,7 +455,7 @@ pub fn receive_unreliable(socket: &mio::net::UdpSocket, buffer: &mut [u8]) -> Ve
 }
 
 pub fn send_sized(
-  stream: &mut std::net::TcpStream,
+  mut stream: impl Write,
   message: HandshakeMessage,
 ) -> std::io::Result<()> {
   let len = bincode::serialized_size(&message)
@@ -578,6 +582,7 @@ pub enum VpnError {
   InvalidData,
   NotFound,
   PermissionDenied,
+  ConnectionReset,
   Other(Box<dyn std::error::Error>),
 }
 
@@ -596,6 +601,7 @@ impl From<std::io::Error> for VpnError {
       ErrorKind::InvalidData => Self::InvalidData,
       ErrorKind::PermissionDenied => Self::PermissionDenied,
       ErrorKind::NotFound => Self::NotFound,
+      ErrorKind::ConnectionReset => Self::ConnectionReset,
       _ => Self::Other(Box::new(value)),
     }
   }
