@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 arrayref = "0.3.7"
 bincode = "1.3.3"
-qprov = { version = "0.1.0", path = "./qprov" }
+qprov = { git = "https://github.com/asakhar/qprov.git" }
 serde = { version = "1.0.160", features = ["derive"] }
 uuid = { version = "1.3.2", features = ["v4", "serde"] }
 openssl = "0.10.48"
