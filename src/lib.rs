@@ -203,7 +203,6 @@ pub enum HandshakeMessage {
   Hello(HelloMessage),
   Premaster(Vec<u8>),
   Ready(EncryptedHandshakeMessage),
-  Network(EncryptedMessage)
 }
 
 #[derive(Serialize, Deserialize)]
