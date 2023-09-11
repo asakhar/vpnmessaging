@@ -471,6 +471,16 @@ pub fn send_sized(mut stream: impl Write, message: HandshakeMessage) -> std::io:
     .map_err(|err| std::io::Error::new(ErrorKind::Other, err))
 }
 
+pub fn send_sized_network(
+  mut stream: impl Write,
+  message: EncryptedMessage,
+) -> std::io::Result<()> {
+  let len = bincode::serialized_size(&message)
+    .map_err(|err| std::io::Error::new(ErrorKind::Other, err))? as u32;
+  stream.write_all(&len.to_be_bytes())?;
+  bincode::serialize_into(stream, &message)
+    .map_err(|err| std::io::Error::new(ErrorKind::Other, err))
+}
 pub struct BufferedTcpStream {
   stream: TcpStream,
   inbuf: Vec<u8>,
