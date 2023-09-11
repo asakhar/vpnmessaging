@@ -219,7 +219,7 @@ impl DecryptedMessage {
   }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EncryptedMessage(Vec<u8>, Uuid);
 
 impl EncryptedMessage {
