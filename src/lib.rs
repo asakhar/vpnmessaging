@@ -101,14 +101,21 @@ impl ClientCrypter {
     let nonce = arrayref::array_ref![data, total_len - Self::NONCE_LEN, 16];
     let tag = &data[total_len - Self::TAG_LEN - Self::NONCE_LEN..total_len - Self::NONCE_LEN];
     let encrypted = &data[..total_len - Self::TAG_LEN - Self::NONCE_LEN];
-    let Ok(decrypted) = openssl::symm::decrypt_aead(openssl::symm::Cipher::aes_256_gcm(), &self.key.0, Some(nonce), &Self::generage_aad(total_len, id), encrypted, tag) else {
+    let Ok(decrypted) = openssl::symm::decrypt_aead(
+      openssl::symm::Cipher::aes_256_gcm(),
+      &self.key.0,
+      Some(nonce),
+      &Self::generage_aad(total_len, id),
+      encrypted,
+      tag,
+    ) else {
       return None;
     };
     if !self.update_nonce(*nonce) {
-      println!(
-        "received message with outdated nonce: {nonce:?}, expected nonce: {:?}",
-        self.iv.wrapping_add(self.de_seq as u128 + 1).to_be_bytes()
-      );
+      // println!(
+      //   "received message with outdated nonce: {nonce:?}, expected nonce: {:?}",
+      //   self.iv.wrapping_add(self.de_seq as u128 + 1).to_be_bytes()
+      // );
       return None;
     }
     Some(decrypted)
@@ -456,10 +463,7 @@ pub fn receive_unreliable(socket: &mio::net::UdpSocket, buffer: &mut [u8]) -> Ve
   }
 }
 
-pub fn send_sized(
-  mut stream: impl Write,
-  message: HandshakeMessage,
-) -> std::io::Result<()> {
+pub fn send_sized(mut stream: impl Write, message: HandshakeMessage) -> std::io::Result<()> {
   let len = bincode::serialized_size(&message)
     .map_err(|err| std::io::Error::new(ErrorKind::Other, err))? as u32;
   stream.write_all(&len.to_be_bytes())?;
